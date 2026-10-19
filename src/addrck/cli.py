@@ -2,7 +2,10 @@
 # Copyright (c) 2026 Addison Kline
 
 import argparse
+import base64
+import random
 import smtplib
+from time import sleep
 
 import dns.resolver
 from validators import email
@@ -41,6 +44,22 @@ def verify_email(
         return code, message
 
 
+def generate_invalid_address(
+    address: str
+) -> str:
+    """
+    Generate an invalid email address with the same domain as the one provided.
+    i.e., an address that has no realistic chance of being used.
+    """
+
+    # the recipient address has already been validated
+    # so we can just do this
+    domain = address.rsplit("@", 1)[1]
+
+    name = base64.urlsafe_b64encode(random.randbytes(16)).decode()
+    return f"{name}@{domain}"
+
+
 def verify_email_syntax(
     address: str
 ) -> str:
@@ -69,6 +88,12 @@ def run():
         "recipient",
         help="the recipient email address to check"
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="include more detailed process output"
+    )
 
     args = parser.parse_args()
 
@@ -76,6 +101,25 @@ def run():
     sender = verify_email_syntax(args.sender)
     recipient = verify_email_syntax(args.recipient)
 
+    # check the recipient directly
     code, message = verify_email(recipient=recipient, sender=sender)
+    if code != 250:
+        print(f"address verification failed: SMTP code {code}")
+        if args.verbose:
+            print(message)
+        return
 
-    print(code, message)
+    sleep(2)
+
+    # now check to see if an invalid address is also accepted
+    recipient_invalid = generate_invalid_address(recipient)
+    code_invalid, message_invalid = verify_email(recipient=recipient_invalid, sender=sender)
+    if code_invalid == 250:
+        print("the recipient domain might accept all mailboxes")
+        if args.verbose:
+            print(message_invalid)
+        return
+
+    print(f"address verification passed: {recipient}")
+    if args.verbose:
+        print(message)
