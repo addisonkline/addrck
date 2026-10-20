@@ -5,6 +5,7 @@ import argparse
 import base64
 import random
 import smtplib
+from sys import exit
 from time import sleep
 
 import dns.resolver
@@ -103,23 +104,43 @@ def run():
 
     # check the recipient directly
     code, message = verify_email(recipient=recipient, sender=sender)
-    if code != 250:
-        print(f"address verification failed: SMTP code {code}")
+    if code == 550:
+        print(f"the address {recipient} is likely nonexistent")
         if args.verbose:
             print(message)
-        return
+        exit(1)
+    if 400 <= code < 499:
+        print(f"inconclusive: SMTP code {code}")
+        print("maybe try again later?")
+        if args.verbose:
+            print(message)
+        exit(2)
 
     sleep(2)
 
     # now check to see if an invalid address is also accepted
     recipient_invalid = generate_invalid_address(recipient)
     code_invalid, message_invalid = verify_email(recipient=recipient_invalid, sender=sender)
-    if code_invalid == 250:
-        print("the recipient domain might accept all mailboxes")
-        if args.verbose:
-            print(message_invalid)
-        return
+    if code_invalid != 550:
+        if code_invalid == 250:
+            print("this domain likely accepts all addresses")
+            print(f"the address {recipient} passed, but so did a likely-nonexistent address")
+            if args.verbose:
+                print(message_invalid)
+            exit(3)
+        elif 400 <= code_invalid < 499:
+            print(f"inconclusive: SMTP code {code}")
+            print("maybe try again later?")
+            if args.verbose:
+                print(message)
+            exit(2)
+        else:
+            print(f"got unexpected SMTP code: {code}")
+            if args.verbose:
+                print(message)
+            exit(4)
 
     print(f"address verification passed: {recipient}")
     if args.verbose:
         print(message)
+    exit(0)
