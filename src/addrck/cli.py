@@ -13,6 +13,39 @@ from validators import email
 from validators.utils import ValidationError
 
 
+def find_mail_exchangers(
+    domain: str,
+) -> dns.resolver.Answer:
+    """
+    Attempt to find the mail exchangers for the given domain.
+    If the domain has no MX records, fall back to A/AAAA records.
+    """
+
+    answers = dns.resolver.resolve(domain, "MX")
+    mx_preferred = min(answers, key=lambda record: record.preference)
+    hostname_preferred = str(mx_preferred.exchange).rstrip(".")
+    if hostname_preferred == "":
+        raise ValueError(f"the domain {domain} does not accept email")
+
+    if len(answers) == 0:
+        answers_fallback = dns.resolver.resolve(domain, "A/AAAA")
+        return answers_fallback
+
+    return sorted(answers, key=lambda mx: mx.preference)
+
+
+def connect_to_exchanger(
+    hostname: str,
+) -> smtplib.SMTP | None:
+    """
+    Attempt an SMTP connection to the exchanger hostname.
+    """
+    try:
+        return smtplib.SMTP(hostname, port=25, timeout=5.0)
+    except (OSError, smtplib.SMTPException):
+        return None
+
+
 def verify_email(
     recipient: str,
     sender: str,
@@ -25,24 +58,37 @@ def verify_email(
     domain = recipient.rsplit("@", 1)[1]
 
     # Find the domain's mail exchangers
-    answers = dns.resolver.resolve(domain, "MX")
-    mx = min(answers, key=lambda r: r.preference)
-    hostname = str(mx.exchange).rstrip(".")
+    exchangers = find_mail_exchangers(domain)
 
     # Connect to the receiving SMTP server
-    with smtplib.SMTP(hostname, 25, timeout=10) as smtp:
-        smtp.ehlo()
+    for mx in exchangers:
+        hostname = str(mx.exchange).rstrip(".")
 
-        # Present the envelope sender
-        sender_code, _ = smtp.mail(sender)
-        if sender_code != 250:
-            raise RuntimeError("Sender rejected")
+        smtp = connect_to_exchanger(hostname)
 
-        # Ask whether this recipient is accepted
-        code, message = smtp.rcpt(recipient)
+        if smtp is None:
+            # print(f"unreachable: {hostname}")
+            continue
 
-        # QUIT is handled by context manager
-        return code, message
+        try:
+            # print(f"connected: {hostname}")
+            smtp.ehlo()
+
+            # Present the envelope sender
+            sender_code, _ = smtp.mail(sender)
+            if sender_code != 250:
+                raise RuntimeError("sender rejected")
+
+            # Ask whether this recipient is accepted
+            code, message = smtp.rcpt(recipient)
+
+            return code, message
+            break
+        finally:
+            smtp.close()
+    else:
+        print("no reachable mail exchangers")
+        exit(5)
 
 
 def generate_invalid_address(
