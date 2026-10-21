@@ -6,7 +6,6 @@ import base64
 import random
 import smtplib
 from sys import exit
-from time import sleep
 
 import dns.resolver
 from validators import email
@@ -36,12 +35,13 @@ def find_mail_exchangers(
 
 def connect_to_exchanger(
     hostname: str,
+    timeout: int,
 ) -> smtplib.SMTP | None:
     """
     Attempt an SMTP connection to the exchanger hostname.
     """
     try:
-        return smtplib.SMTP(hostname, port=25, timeout=5.0)
+        return smtplib.SMTP(hostname, port=25, timeout=float(timeout))
     except (OSError, smtplib.SMTPException):
         return None
 
@@ -49,6 +49,7 @@ def connect_to_exchanger(
 def verify_email(
     recipient: str,
     sender: str,
+    timeout: int,
 ) -> tuple[int, bytes, int, bytes]:
     """
     Process for validating an individual email via SMTP.
@@ -64,7 +65,7 @@ def verify_email(
     for mx in exchangers:
         hostname = str(mx.exchange).rstrip(".")
 
-        smtp = connect_to_exchanger(hostname)
+        smtp = connect_to_exchanger(hostname, timeout)
 
         if smtp is None:
             # print(f"unreachable: {hostname}")
@@ -128,6 +129,19 @@ def verify_email_syntax(
     return address
 
 
+def verify_timeout(
+    timeout: int
+) -> int:
+    """
+    Ensure the provided timeout limit (in seconds) is valid.
+    """
+
+    if timeout < 0:
+        raise ValueError("timeout must be >= 0 seconds")
+
+    return timeout
+
+
 def run():
     parser = argparse.ArgumentParser(
         prog="addrck",
@@ -148,15 +162,23 @@ def run():
         action="store_true",
         help="include more detailed process output"
     )
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        type=int,
+        default=5,
+        help="the number of seconds until the SMTP connection times out (default: %(default)s)"
+    )
 
     args = parser.parse_args()
 
     # validate sender and recipient addresses
     sender = verify_email_syntax(args.sender)
     recipient = verify_email_syntax(args.recipient)
+    timeout = verify_timeout(args.timeout)
 
     # check the recipient directly
-    real_code, real_message, fake_code, fake_message = verify_email(recipient, sender)
+    real_code, real_message, fake_code, fake_message = verify_email(recipient, sender, timeout)
 
     if real_code == 550:
         print(f"the address {recipient} is likely nonexistent")
