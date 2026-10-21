@@ -49,7 +49,7 @@ def connect_to_exchanger(
 def verify_email(
     recipient: str,
     sender: str,
-) -> tuple[int, bytes]:
+) -> tuple[int, bytes, int, bytes]:
     """
     Process for validating an individual email via SMTP.
     """
@@ -74,15 +74,22 @@ def verify_email(
             # print(f"connected: {hostname}")
             smtp.ehlo()
 
+            # check provided address
             # Present the envelope sender
             sender_code, _ = smtp.mail(sender)
             if sender_code != 250:
                 raise RuntimeError("sender rejected")
-
             # Ask whether this recipient is accepted
-            code, message = smtp.rcpt(recipient)
+            real_code, real_message = smtp.rcpt(recipient)
 
-            return code, message
+            smtp.rset()
+
+            # generate fake address and check that too
+            fake_recipient = generate_invalid_address(recipient)
+            smtp.mail(sender)
+            fake_code, fake_message = smtp.rcpt(fake_recipient)
+
+            return real_code, real_message, fake_code, fake_message
             break
         finally:
             smtp.close()
@@ -149,44 +156,47 @@ def run():
     recipient = verify_email_syntax(args.recipient)
 
     # check the recipient directly
-    code, message = verify_email(recipient=recipient, sender=sender)
-    if code == 550:
+    real_code, real_message, fake_code, fake_message = verify_email(recipient, sender)
+
+    if real_code == 550:
         print(f"the address {recipient} is likely nonexistent")
         if args.verbose:
-            print(message)
+            print(real_message)
         exit(1)
-    if 400 <= code < 499:
-        print(f"inconclusive: SMTP code {code}")
-        print("maybe try again later?")
+    elif 400 <= real_code < 500:
+        print(f"temporary failure checking {recipient}")
+        print("perhaps try again later?")
         if args.verbose:
-            print(message)
+            print(real_message)
         exit(2)
-
-    sleep(2)
-
-    # now check to see if an invalid address is also accepted
-    recipient_invalid = generate_invalid_address(recipient)
-    code_invalid, message_invalid = verify_email(recipient=recipient_invalid, sender=sender)
-    if code_invalid != 550:
-        if code_invalid == 250:
-            print("this domain likely accepts all addresses")
-            print(f"the address {recipient} passed, but so did a likely-nonexistent address")
+    elif real_code == 250:
+        if fake_code == 550:
+            print(f"the address {recipient} is likely valid")
             if args.verbose:
-                print(message_invalid)
-            exit(3)
-        elif 400 <= code_invalid < 499:
-            print(f"inconclusive: SMTP code {code}")
-            print("maybe try again later?")
+                print(real_message)
+                print(fake_message)
+            exit(0)
+        elif fake_code == 250:
+            print("this domain might accept all addresses")
+            print(f"the address {recipient} passed validation, but so did a likely-nonexistent mailbox address")
             if args.verbose:
-                print(message)
+                print(real_message)
+                print(fake_message)
+            exit(4)
+        elif 400 <= fake_code < 500:
+            print(f"temporary failure checking {recipient}")
+            print("perhaps try again later?")
+            if args.verbose:
+                print(real_message)
+                print(fake_message)
             exit(2)
         else:
-            print(f"got unexpected SMTP code: {code}")
+            print(f"got SMTP code {real_code}")
             if args.verbose:
-                print(message)
-            exit(4)
-
-    print(f"address verification passed: {recipient}")
-    if args.verbose:
-        print(message)
-    exit(0)
+                print(real_message)
+            exit(3) 
+    else:
+        print(f"address validation failed for {recipient}: got SMTP code {real_code}")
+        if args.verbose:
+            print(real_message)
+        exit(3)
