@@ -20,7 +20,11 @@ def find_mail_exchangers(
     If the domain has no MX records, fall back to A/AAAA records.
     """
 
-    answers = dns.resolver.resolve(domain, "MX")
+    try:
+        answers = dns.resolver.resolve(domain, "MX")
+    except dns.resolver.NXDOMAIN as e:
+        raise ValueError(f"bad domain: {domain}") from e
+    
     mx_preferred = min(answers, key=lambda record: record.preference)
     hostname_preferred = str(mx_preferred.exchange).rstrip(".")
     if hostname_preferred == "":
@@ -95,8 +99,7 @@ def verify_email(
         finally:
             smtp.close()
     else:
-        print("no reachable mail exchangers")
-        exit(5)
+        raise RuntimeError("no reachable mail exchangers")
 
 
 def generate_invalid_address(
@@ -173,12 +176,24 @@ def run():
     args = parser.parse_args()
 
     # validate sender and recipient addresses
-    sender = verify_email_syntax(args.sender)
-    recipient = verify_email_syntax(args.recipient)
-    timeout = verify_timeout(args.timeout)
+    try:
+        sender = verify_email_syntax(args.sender)
+        recipient = verify_email_syntax(args.recipient)
+        timeout = verify_timeout(args.timeout)
+    except ValueError as e:
+        print(e)
+        exit(5)
+
 
     # check the recipient directly
-    real_code, real_message, fake_code, fake_message = verify_email(recipient, sender, timeout)
+    try:
+        real_code, real_message, fake_code, fake_message = verify_email(recipient, sender, timeout)
+    except ValueError as e:
+        print(f"invalid input: {e}")
+        exit(5)
+    except RuntimeError as e:
+        print(f"unexpected runtime error: {e}")
+        exit(6)
 
     if real_code == 550:
         print(f"the address {recipient} is likely nonexistent")
