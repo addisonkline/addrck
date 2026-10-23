@@ -1,30 +1,76 @@
 # addrck
-simple SMTP email address verifier
 
-## Development and tests
+addrck is a command-line email address checker. It validates address syntax,
+looks up the recipient domain's mail servers, and asks an SMTP server whether it
+accepts the recipient. It also checks a randomly generated address on the same
+domain to help identify servers that accept every address.
 
-Use Python 3.13 or newer and uv to install the project and development dependencies:
+The result is an estimate of whether a mailbox exists. SMTP acceptance does not
+guarantee delivery, and server policies can make a check inconclusive. addrck
+uses SMTP envelope commands without submitting a message.
+
+## Quick start
+
+You need Python 3.13 or newer, uv, a local checkout of this repository, and network
+access to DNS and outbound TCP port 25. From the repository root:
+
+```sh
+uv sync --locked
+uv run addrck --help
+uv run addrck sender@example.org person@example.com
+```
+
+Replace the example addresses with your envelope sender and the recipient you
+want to check. Argument order is **sender, then recipient**.
+
+For additional SMTP response details and a longer socket timeout:
+
+```sh
+uv run addrck --verbose --timeout 10 sender@example.org person@example.com
+```
+
+See [installation](docs/installation.md) for a pip installation and setup without
+development dependencies, and [usage](docs/usage.md) for the complete CLI reference.
+
+## Results
+
+addrck prints a human-readable result and exits with a status code:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Recipient accepted and probe rejected with `550`: likely valid. Also used for `--help`. |
+| `1` | Recipient rejected with `550`: likely nonexistent. |
+| `2` | Temporary SMTP failure, or a command-line argument error. |
+| `3` | SMTP recipient/probe response outside the recognized cases. |
+| `4` | Recipient and probe both accepted: possible catch-all domain. |
+| `5` | Invalid input or a domain without usable mail routing. |
+| `6` | DNS resolver, SMTP connection, or SMTP command failure. |
+
+The [usage guide](docs/usage.md#exit-statuses) explains the exact response rules
+and how to capture the status in a script. For inconclusive results, start with
+[troubleshooting](docs/troubleshooting.md).
+
+## Documentation
+
+Browse the [documentation index](docs/README.md), or go directly to:
+
+- [Installation](docs/installation.md): requirements and local installation.
+- [Usage](docs/usage.md): arguments, examples, output, and exit statuses.
+- [How validation works](docs/validation.md): DNS resolution, SMTP sequence, and limitations.
+- [Troubleshooting](docs/troubleshooting.md): common errors and next steps.
+- [Development](docs/development.md): source layout, tests, and contribution guidance.
+
+## Development
 
 ```sh
 uv sync --locked
 uv run pytest
-```
-
-To include branch coverage and report uncovered lines:
-
-```sh
 uv run pytest --cov --cov-report=term-missing
 ```
 
-The suite covers input validation, DNS lookup and address-record fallback, SMTP
-command order and connection cleanup, and CLI output and exit statuses. DNS and
-SMTP connections are mocked; tests do not contact public mail servers. An
-automatic fixture rejects unmocked DNS lookups and SMTP connections.
+Tests mock DNS and SMTP; they do not contact public mail servers. GitHub Actions
+is configured to run the suite on Python 3.13 and 3.14.
 
-Missing MX records fall back to the domain itself when it has A or AAAA records.
-Nonexistent domains, null MX records, and domains without address records are
-input errors (exit 5). Resolver failures, SMTP command failures, and unreachable
-exchangers are runtime errors (exit 6). Recipient/probe reply codes determine the
-remaining validation outcomes; SMTP acceptance does not guarantee delivery.
+## License
 
-GitHub Actions runs the suite on Python 3.13 and 3.14.
+Released under the [MIT License](LICENSE).
