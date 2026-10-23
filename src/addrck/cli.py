@@ -7,34 +7,52 @@ import random
 import smtplib
 from sys import exit
 
+import dns.exception
+import dns.name
+import dns.rdataclass
+import dns.rdatatype
 import dns.resolver
+from dns.rdtypes.ANY.MX import MX
 from validators import email
 from validators.utils import ValidationError
 
 
 def find_mail_exchangers(
     domain: str,
-) -> dns.resolver.Answer:
+) -> list[MX]:
     """
     Attempt to find the mail exchangers for the given domain.
     If the domain has no MX records, fall back to A/AAAA records.
     """
 
     try:
-        answers = dns.resolver.resolve(domain, "MX")
+        try:
+            answers = list(dns.resolver.resolve(domain, "MX"))
+        except dns.resolver.NoAnswer:
+            answers = []
+
+        if not answers:
+            # An implicit MX points to the domain itself, not an address record.
+            for record_type in ("A", "AAAA"):
+                try:
+                    addresses = dns.resolver.resolve(domain, record_type)
+                except dns.resolver.NoAnswer:
+                    continue
+                if addresses:
+                    return [MX(
+                        dns.rdataclass.IN, dns.rdatatype.MX, 0,
+                        dns.name.from_text(domain),
+                    )]
+            raise ValueError(f"no mail exchangers or address records for {domain}")
+
+        answers.sort(key=lambda record: record.preference)
+        if str(answers[0].exchange) == ".":
+            raise ValueError(f"the domain {domain} does not accept email")
+        return answers
     except dns.resolver.NXDOMAIN as e:
         raise ValueError(f"bad domain: {domain}") from e
-    
-    mx_preferred = min(answers, key=lambda record: record.preference)
-    hostname_preferred = str(mx_preferred.exchange).rstrip(".")
-    if hostname_preferred == "":
-        raise ValueError(f"the domain {domain} does not accept email")
-
-    if len(answers) == 0:
-        answers_fallback = dns.resolver.resolve(domain, "A/AAAA")
-        return answers_fallback
-
-    return sorted(answers, key=lambda mx: mx.preference)
+    except dns.exception.DNSException as e:
+        raise RuntimeError(f"DNS lookup failed for {domain}: {e}") from e
 
 
 def connect_to_exchanger(
@@ -77,7 +95,9 @@ def verify_email(
 
         try:
             # print(f"connected: {hostname}")
-            smtp.ehlo()
+            ehlo_code, _ = smtp.ehlo()
+            if ehlo_code != 250:
+                raise RuntimeError("SMTP greeting rejected")
 
             # check provided address
             # Present the envelope sender
@@ -87,15 +107,20 @@ def verify_email(
             # Ask whether this recipient is accepted
             real_code, real_message = smtp.rcpt(recipient)
 
-            smtp.rset()
+            reset_code, _ = smtp.rset()
+            if reset_code != 250:
+                raise RuntimeError("SMTP reset rejected")
 
             # generate fake address and check that too
             fake_recipient = generate_invalid_address(recipient)
-            smtp.mail(sender)
+            sender_code, _ = smtp.mail(sender)
+            if sender_code != 250:
+                raise RuntimeError("sender rejected for probe")
             fake_code, fake_message = smtp.rcpt(fake_recipient)
 
             return real_code, real_message, fake_code, fake_message
-            break
+        except (OSError, smtplib.SMTPException) as e:
+            raise RuntimeError(f"SMTP exchange failed with {hostname}: {e}") from e
         finally:
             smtp.close()
     else:
@@ -228,9 +253,9 @@ def run():
                 print(fake_message)
             exit(2)
         else:
-            print(f"got SMTP code {real_code}")
+            print(f"got SMTP code {fake_code} for probe address")
             if args.verbose:
-                print(real_message)
+                print(fake_message)
             exit(3) 
     else:
         print(f"address validation failed for {recipient}: got SMTP code {real_code}")

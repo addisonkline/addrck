@@ -18,3 +18,19 @@ addrck = "addrck.cli:run"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["addrck"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+]
