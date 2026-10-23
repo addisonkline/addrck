@@ -29,7 +29,7 @@ def test_null_mx_rejects_domain_without_fallback(monkeypatch):
     resolve = Mock(return_value=records("MX", "0 ."))
     monkeypatch.setattr(cli.dns.resolver, "resolve", resolve)
 
-    with pytest.raises(ValueError, match="does not accept email"):
+    with pytest.raises(cli.UndeliverableDomain, match="does not accept email"):
         cli.find_mail_exchangers("example.com")
 
     resolve.assert_called_once_with("example.com", "MX")
@@ -62,7 +62,7 @@ def test_no_mx_or_address_records(monkeypatch):
     resolve = Mock(side_effect=dns.resolver.NoAnswer)
     monkeypatch.setattr(cli.dns.resolver, "resolve", resolve)
 
-    with pytest.raises(ValueError, match="no mail exchangers or address records"):
+    with pytest.raises(cli.UndeliverableDomain, match="no mail exchangers or address records"):
         cli.find_mail_exchangers("example.com")
 
     assert resolve.call_args_list == [
@@ -71,9 +71,10 @@ def test_no_mx_or_address_records(monkeypatch):
 
 
 @pytest.mark.parametrize("error, exception_type, message", [
-    (dns.resolver.NXDOMAIN(), ValueError, "bad domain"),
-    (dns.exception.Timeout(), RuntimeError, "DNS lookup failed"),
-    (dns.resolver.NoNameservers(), RuntimeError, "DNS lookup failed"),
+    (dns.resolver.NXDOMAIN(), cli.UndeliverableDomain, "nonexistent domain"),
+    (dns.exception.Timeout(), cli.TemporaryFailure, "DNS lookup failed"),
+    (dns.resolver.NoNameservers(), cli.TemporaryFailure, "DNS lookup failed"),
+    (dns.exception.DNSException("bad response"), RuntimeError, "DNS lookup failed"),
 ])
 @pytest.mark.parametrize("lookup_stage", ["MX", "A", "AAAA"])
 def test_resolver_errors(monkeypatch, error, exception_type, message, lookup_stage):

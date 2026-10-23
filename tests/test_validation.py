@@ -20,14 +20,14 @@ def test_invalid_email(address):
         cli.verify_email_syntax(address)
 
 
-@pytest.mark.parametrize("timeout", [0, 1, 5, 60])
+@pytest.mark.parametrize("timeout", [1, 5, 60])
 def test_valid_timeout(timeout):
     assert cli.verify_timeout(timeout) == timeout
 
 
-@pytest.mark.parametrize("timeout", [-1, -100])
-def test_negative_timeout(timeout):
-    with pytest.raises(ValueError, match="timeout must be >= 0 seconds"):
+@pytest.mark.parametrize("timeout", [0, -1, -100])
+def test_nonpositive_timeout(timeout):
+    with pytest.raises(ValueError, match="timeout must be > 0 seconds"):
         cli.verify_timeout(timeout)
 
 

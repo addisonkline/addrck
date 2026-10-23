@@ -76,7 +76,7 @@ def test_unreachable_primary_tries_backup(exchanger_setup, smtp):
 
 def test_all_exchangers_unreachable(exchanger_setup, smtp):
     exchanger_setup.return_value = None
-    with pytest.raises(RuntimeError, match="no reachable mail exchangers"):
+    with pytest.raises(cli.TemporaryFailure, match="no reachable mail exchangers"):
         cli.verify_email(RECIPIENT, SENDER, 5)
     assert exchanger_setup.call_count == 2
     smtp.close.assert_not_called()
@@ -88,27 +88,37 @@ def test_all_exchangers_unreachable(exchanger_setup, smtp):
     ("rset", "SMTP reset rejected", 1),
     ("second_mail", "sender rejected for probe", 1),
 ])
+@pytest.mark.parametrize("code, error_type", [(450, cli.TemporaryFailure), (550, RuntimeError)])
 def test_command_rejection_closes_connection(
-    exchanger_setup, smtp, stage, message, expected_rcpts,
+    exchanger_setup, smtp, stage, message, expected_rcpts, code, error_type,
 ):
     if stage == "first_mail":
-        smtp.mail.return_value = (550, b"rejected")
+        smtp.mail.return_value = (code, b"rejected")
     elif stage == "second_mail":
-        smtp.mail.side_effect = [(250, b"ok"), (550, b"rejected")]
+        smtp.mail.side_effect = [(250, b"ok"), (code, b"rejected")]
     else:
-        getattr(smtp, stage).return_value = (550, b"rejected")
+        getattr(smtp, stage).return_value = (code, b"rejected")
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(error_type, match=message) as exc:
         cli.verify_email(RECIPIENT, SENDER, 5)
 
+    assert type(exc.value) is error_type
+    assert f"SMTP code {code}" in str(exc.value)
+    assert "rejected" in str(exc.value)
     assert smtp.rcpt.call_count == expected_rcpts
     smtp.close.assert_called_once_with()
     assert smtp.mock_calls[-1] == call.close()
 
 
 @pytest.mark.parametrize("stage", ["ehlo", "first_mail", "real_rcpt", "rset", "second_mail", "probe_rcpt"])
-@pytest.mark.parametrize("error", [OSError("socket failed"), smtplib.SMTPServerDisconnected("disconnected")])
-def test_exchange_errors_close_connection(exchanger_setup, smtp, stage, error):
+@pytest.mark.parametrize("error, error_type", [
+    (OSError("socket failed"), cli.TemporaryFailure),
+    (smtplib.SMTPServerDisconnected("disconnected"), cli.TemporaryFailure),
+    (smtplib.SMTPResponseException(421, b"try later"), cli.TemporaryFailure),
+    (smtplib.SMTPResponseException(554, b"refused"), RuntimeError),
+    (smtplib.SMTPException("bad protocol"), RuntimeError),
+])
+def test_exchange_errors_close_connection(exchanger_setup, smtp, stage, error, error_type):
     if stage == "first_mail":
         smtp.mail.side_effect = error
     elif stage == "second_mail":
@@ -120,18 +130,80 @@ def test_exchange_errors_close_connection(exchanger_setup, smtp, stage, error):
     else:
         getattr(smtp, stage).side_effect = error
 
-    with pytest.raises(RuntimeError, match="SMTP exchange failed with primary.example.com") as exc:
+    with pytest.raises(error_type, match="SMTP exchange failed with primary.example.com") as exc:
         cli.verify_email(RECIPIENT, SENDER, 5)
 
+    assert type(exc.value) is error_type
     assert exc.value.__cause__ is error
     smtp.close.assert_called_once_with()
     assert smtp.mock_calls[-1] == call.close()
 
 
-@pytest.mark.parametrize("real_code, fake_code", [(550, 550), (450, 550), (250, 250), (250, 450)])
+@pytest.mark.parametrize("real_code, fake_code", [(250, 550), (250, 250), (250, 450)])
 def test_recipient_responses_pass_through(exchanger_setup, smtp, real_code, fake_code):
     smtp.rcpt.side_effect = [(real_code, b"real"), (fake_code, b"probe")]
     assert cli.verify_email(RECIPIENT, SENDER, 5) == (real_code, b"real", fake_code, b"probe")
+    smtp.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("real_code", [400, 450, 499, 550, 554, 251])
+def test_unaccepted_recipient_skips_probe(exchanger_setup, smtp, real_code):
+    smtp.rcpt.side_effect = [(real_code, b"recipient reply")]
+    smtp.rset.side_effect = smtplib.SMTPServerDisconnected("must not reset")
+
+    assert cli.verify_email(RECIPIENT, SENDER, 5) == (real_code, b"recipient reply", None, None)
+    cli.generate_invalid_address.assert_not_called()
+    assert smtp.mock_calls == [
+        call.ehlo(), call.mail(SENDER), call.rcpt(RECIPIENT), call.close(),
+    ]
+
+
+@pytest.mark.parametrize("error", [
+    smtplib.SMTPConnectError(554, b"refused"), smtplib.SMTPException("bad protocol"),
+])
+def test_permanent_connection_failure(monkeypatch, error):
+    monkeypatch.setattr(cli.smtplib, "SMTP", Mock(side_effect=error))
+
+    with pytest.raises(RuntimeError, match="SMTP connection failed") as exc:
+        cli.connect_to_exchanger("mx.example.com", 5)
+
+    assert type(exc.value) is RuntimeError
+    assert exc.value.__cause__ is error
+
+
+def test_permanent_primary_failure_tries_backup(exchanger_setup, smtp):
+    exchanger_setup.side_effect = [RuntimeError("SMTP code 554"), smtp]
+    assert cli.verify_email(RECIPIENT, SENDER, 5)[0] == 250
+    assert exchanger_setup.call_count == 2
+
+
+@pytest.mark.parametrize("failures, error_type", [
+    ([RuntimeError("SMTP code 554"), RuntimeError("SMTP code 554")], RuntimeError),
+    ([RuntimeError("SMTP code 554"), None], cli.TemporaryFailure),
+    ([None, RuntimeError("SMTP code 554")], cli.TemporaryFailure),
+])
+def test_exhausted_exchangers_classification(exchanger_setup, failures, error_type):
+    exchanger_setup.side_effect = failures
+    with pytest.raises(error_type) as exc:
+        cli.verify_email(RECIPIENT, SENDER, 5)
+    assert type(exc.value) is error_type
+    assert exchanger_setup.call_count == 2
+
+
+@pytest.mark.parametrize("real_code", [250, 550])
+def test_close_failure_preserves_result(exchanger_setup, smtp, real_code):
+    smtp.rcpt.side_effect = [(real_code, b"real"), (550, b"probe")]
+    smtp.close.side_effect = OSError("close failed")
+    result = cli.verify_email(RECIPIENT, SENDER, 5)
+    assert result[0] == real_code
+    smtp.close.assert_called_once_with()
+
+
+def test_close_failure_preserves_original_error(exchanger_setup, smtp):
+    smtp.ehlo.return_value = (450, b"try later")
+    smtp.close.side_effect = OSError("close failed")
+    with pytest.raises(cli.TemporaryFailure, match="SMTP code 450"):
+        cli.verify_email(RECIPIENT, SENDER, 5)
     smtp.close.assert_called_once_with()
 
 

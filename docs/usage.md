@@ -22,9 +22,8 @@ Both addresses must pass syntax validation. The sender is not independently
 checked for mailbox existence; it is supplied to the receiving server during
 both the recipient and probe transactions.
 
-Use a positive timeout. Negative values are rejected during input validation.
-Zero passes that validation, but Python's SMTP client rejects a zero socket
-timeout when a connection is attempted. Zero does not mean unlimited time.
+Use a positive timeout. Zero and negative values are rejected before any DNS or
+SMTP activity, with exit `2`. Zero does not mean unlimited time.
 
 The timeout is passed to each SMTP connection and its socket operations. It is
 not a deadline for the complete check and does not configure DNS resolver
@@ -53,30 +52,38 @@ DNS or SMTP connection trace.
 
 ## Exit statuses
 
-These classifications apply after the SMTP exchange completes. The probe is a
-randomly generated address on the recipient's domain.
+Exit statuses distinguish validation outcomes from problems running the check.
+The probe is a randomly generated address on the recipient's domain; it is only
+checked after the real recipient returns `250`.
 
 | Status | Condition | Interpretation |
 | --- | --- | --- |
 | `0` | Recipient `250`, probe `550`. | Likely valid recipient. |
-| `1` | Recipient `550`, regardless of probe reply. | Likely nonexistent recipient. |
-| `2` | Recipient `400`–`499`, or recipient `250` and probe `400`–`499`. | Temporary failure; try again later. |
+| `1` | Recipient `550`; or recipient domain is nonexistent, has a null MX, or has no MX/A/AAAA records. | Undeliverable recipient/domain. |
+| `2` | Missing/extra arguments, unknown options, invalid address syntax, or a timeout that is not a positive integer. | Fix the invocation before retrying. |
 | `3` | Any other recipient reply, or recipient `250` and an unrecognized probe reply. | Unclassified SMTP response. |
 | `4` | Recipient `250`, probe `250`. | Possible catch-all domain; mailbox existence is uncertain. |
-| `5` | Invalid address/timeout, nonexistent domain, null MX, or missing mail/address records. | Input or domain routing error. |
-| `6` | DNS resolver failure, all exchangers unreachable, failed EHLO/RSET/MAIL, or an SMTP exchange exception. | Runtime failure; no reliable mailbox result. |
+| `5` | DNS timeout or unavailable nameservers; connection/socket failure; disconnect; or SMTP `4xx` at any stage. | Temporary failure; a later retry may help. |
+| `6` | Other DNS errors, SMTP protocol exceptions, or non-`4xx` failure of a required greeting/EHLO/RSET/MAIL command. | Check could not complete; inspect the error. |
 
-`--help` also exits with `0`. Missing arguments, unknown options, and noninteger
-timeouts are handled by the argument parser and exit with `2`. Check the output
-to distinguish argument errors from temporary SMTP failures.
+`--help` also exits with `0`, without checking an address. Otherwise, only the
+likely-valid outcome exits with `0`. A sender rejection never marks the recipient
+undeliverable: SMTP `4xx` exits with `5`, and other sender rejections exit with `6`.
 
 The classifier specifically recognizes `250` and `550`; it does not treat every
 `2xx` reply as success or every `5xx` reply as a nonexistent mailbox. For example,
 a recipient response of `554` exits with `3`.
 
-If a command fails before classification, the runtime error takes precedence.
-For example, the program still attempts the probe after a real recipient `550`;
-a subsequent RSET failure produces exit `6` rather than exit `1`.
+After a real recipient reply other than `250`, the connection is closed without
+RSET or a probe. A subsequent cleanup error cannot replace that result. If the
+recipient was accepted but the probe transaction fails, the result is a temporary
+or runtime failure, rather than a likely-valid result.
+
+Connections are tried in MX order. A failed connection can be followed by a
+successful backup, in which case the completed exchange determines the status.
+If every connection fails, exit `5` when any attempt had a transport failure or
+`4xx` reply; exit `6` when all failures were non-temporary SMTP errors. A failure
+after a connection succeeds ends the check without trying another MX.
 
 ## Use in a shell script
 
@@ -92,15 +99,17 @@ fi
 
 case "$status" in
     0) echo "Recipient likely valid" ;;
-    1) echo "Recipient likely nonexistent" ;;
-    2) echo "Check arguments or retry a temporary failure" ;;
+    1) echo "Recipient or domain is undeliverable" ;;
+    2) echo "Fix the command arguments" ;;
     3|4) echo "Mailbox existence is uncertain" ;;
-    5|6) echo "Check failed; inspect the reported error" ;;
+    5) echo "Temporary failure; retry later" ;;
+    6) echo "Check failed; inspect the reported error" ;;
     *) echo "Unexpected process status: $status" ;;
 esac
 ```
 
-Validation results, verbose responses, and handled input/runtime errors go to
-standard output. Argument-parser errors go to standard error. Output is
-human-readable; there is no JSON mode. The statuses above describe addrck after
-it starts; an environment or installation failure in uv can have its own status.
+Validation outcomes (`0`, `1`, `3`, `4`) and their verbose responses go to standard
+output. Usage errors (`2`) and temporary/runtime failures (`5`, `6`) go to standard
+error, including verbose responses for temporary failures. Output is human-readable;
+there is no JSON mode. The statuses above describe addrck after it starts; an
+environment or installation failure in uv can have its own status.

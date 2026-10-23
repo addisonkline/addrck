@@ -17,22 +17,25 @@ The DNS lookup follows these rules:
    MX with preference zero. The address record is not passed to SMTP as an MX.
 5. Reject a nonexistent domain or a domain with no MX, A, or AAAA answers.
 
-Resolver errors such as timeouts stop the lookup with a runtime error. An error
-on an A lookup does not trigger an AAAA retry; the fallback continues only when
-the lookup has no answer.
+A nonexistent domain, null MX, or missing mail/address records produces an
+undeliverable result (exit `1`). Resolver timeouts and unavailable nameservers
+produce temporary failures (exit `5`); other resolver errors use exit `6`.
+An error on an A lookup does not trigger an AAAA retry; the fallback continues
+only when the lookup has no answer.
 
 ## SMTP exchange
 
 addrck connects directly to exchangers on TCP port 25, in preference order. A
 connection failure advances to the next exchanger. If none can be reached, the
-check fails.
+check fails. Exhausted connections use exit `5` if any failure was temporary,
+or exit `6` if all failures were other SMTP errors.
 
 Once connected, the exchange follows this sequence:
 
 ```text
 EHLO                         require 250
 MAIL FROM:<sender>           require 250
-RCPT TO:<recipient>          record real reply
+RCPT TO:<recipient>          record real reply; stop unless 250
 RSET                         require 250
 MAIL FROM:<sender>           require 250
 RCPT TO:<random-probe>       record probe reply
@@ -46,11 +49,15 @@ existing mailbox.
 The connection is closed in a `finally` block after success or failure during the
 exchange. No `DATA` command is issued, so no message body is submitted. The client
 closes the socket rather than sending `QUIT`.
+Socket/SMTP exceptions during close are ignored so cleanup cannot replace a
+validation result or the original failure.
 
 Once a connection succeeds, a command rejection or exchange exception ends the
 check; addrck does not retry that exchange against another MX. It attempts the
-probe even when the real recipient is rejected. See [exit statuses](usage.md#exit-statuses)
-for how replies become CLI results.
+probe only after the real recipient returns `250`. SMTP `4xx` replies at any
+stage produce a temporary failure. A non-`4xx` failure of EHLO, RSET, or MAIL is
+a runtime failure, rather than evidence about the recipient. See
+[exit statuses](usage.md#exit-statuses) for the complete classification.
 
 ## What a result establishes
 

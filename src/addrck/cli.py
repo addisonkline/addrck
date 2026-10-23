@@ -5,6 +5,9 @@ import argparse
 import base64
 import random
 import smtplib
+import sys
+from contextlib import suppress
+from enum import IntEnum
 from sys import exit
 
 import dns.exception
@@ -15,6 +18,35 @@ import dns.resolver
 from dns.rdtypes.ANY.MX import MX
 from validators import email
 from validators.utils import ValidationError
+
+
+class ExitCode(IntEnum):
+    VALID = 0
+    UNDELIVERABLE = 1
+    USAGE_ERROR = 2
+    INCONCLUSIVE = 3
+    CATCH_ALL = 4
+    TEMPORARY_FAILURE = 5
+    RUNTIME_ERROR = 6
+
+
+class UndeliverableDomain(ValueError):
+    """The recipient domain has no usable mail routing."""
+
+
+class TemporaryFailure(RuntimeError):
+    """The check could not complete and may succeed on a later attempt."""
+
+
+def _smtp_failure(context: str, code: int, message: bytes) -> RuntimeError:
+    error_type = TemporaryFailure if 400 <= code < 500 else RuntimeError
+    return error_type(f"{context}: got SMTP code {code}: {message!r}")
+
+
+def _require_smtp_success(reply: tuple[int, bytes], context: str) -> None:
+    code, message = reply
+    if code != 250:
+        raise _smtp_failure(context, code, message)
 
 
 def find_mail_exchangers(
@@ -43,14 +75,16 @@ def find_mail_exchangers(
                         dns.rdataclass.IN, dns.rdatatype.MX, 0,
                         dns.name.from_text(domain),
                     )]
-            raise ValueError(f"no mail exchangers or address records for {domain}")
+            raise UndeliverableDomain(f"no mail exchangers or address records for {domain}")
 
         answers.sort(key=lambda record: record.preference)
         if str(answers[0].exchange) == ".":
-            raise ValueError(f"the domain {domain} does not accept email")
+            raise UndeliverableDomain(f"the domain {domain} does not accept email")
         return answers
     except dns.resolver.NXDOMAIN as e:
-        raise ValueError(f"bad domain: {domain}") from e
+        raise UndeliverableDomain(f"nonexistent domain: {domain}") from e
+    except (dns.exception.Timeout, dns.resolver.NoNameservers) as e:
+        raise TemporaryFailure(f"DNS lookup failed for {domain}: {e}") from e
     except dns.exception.DNSException as e:
         raise RuntimeError(f"DNS lookup failed for {domain}: {e}") from e
 
@@ -64,7 +98,15 @@ def connect_to_exchanger(
     """
     try:
         return smtplib.SMTP(hostname, port=25, timeout=float(timeout))
-    except (OSError, smtplib.SMTPException):
+    except smtplib.SMTPServerDisconnected:
+        return None
+    except smtplib.SMTPResponseException as e:
+        if 400 <= e.smtp_code < 500:
+            return None
+        raise _smtp_failure(f"SMTP connection failed with {hostname}", e.smtp_code, e.smtp_error) from e
+    except smtplib.SMTPException as e:
+        raise RuntimeError(f"SMTP connection failed with {hostname}: {e}") from e
+    except OSError:
         return None
 
 
@@ -72,7 +114,7 @@ def verify_email(
     recipient: str,
     sender: str,
     timeout: int,
-) -> tuple[int, bytes, int, bytes]:
+) -> tuple[int, bytes, int | None, bytes | None]:
     """
     Process for validating an individual email via SMTP.
     """
@@ -84,47 +126,58 @@ def verify_email(
     exchangers = find_mail_exchangers(domain)
 
     # Connect to the receiving SMTP server
+    temporary_connection_failure = False
+    last_connection_error = None
     for mx in exchangers:
         hostname = str(mx.exchange).rstrip(".")
 
-        smtp = connect_to_exchanger(hostname, timeout)
+        try:
+            smtp = connect_to_exchanger(hostname, timeout)
+        except RuntimeError as e:
+            last_connection_error = e
+            continue
 
         if smtp is None:
-            # print(f"unreachable: {hostname}")
+            temporary_connection_failure = True
             continue
 
         try:
-            # print(f"connected: {hostname}")
-            ehlo_code, _ = smtp.ehlo()
-            if ehlo_code != 250:
-                raise RuntimeError("SMTP greeting rejected")
+            _require_smtp_success(smtp.ehlo(), "SMTP greeting rejected")
 
             # check provided address
             # Present the envelope sender
-            sender_code, _ = smtp.mail(sender)
-            if sender_code != 250:
-                raise RuntimeError("sender rejected")
+            _require_smtp_success(smtp.mail(sender), "sender rejected")
             # Ask whether this recipient is accepted
             real_code, real_message = smtp.rcpt(recipient)
+            # Only an accepted recipient needs a catch-all probe. In particular,
+            # a later probe failure must not replace a recipient rejection.
+            if real_code != 250:
+                return real_code, real_message, None, None
 
-            reset_code, _ = smtp.rset()
-            if reset_code != 250:
-                raise RuntimeError("SMTP reset rejected")
+            _require_smtp_success(smtp.rset(), "SMTP reset rejected")
 
             # generate fake address and check that too
             fake_recipient = generate_invalid_address(recipient)
-            sender_code, _ = smtp.mail(sender)
-            if sender_code != 250:
-                raise RuntimeError("sender rejected for probe")
+            _require_smtp_success(smtp.mail(sender), "sender rejected for probe")
             fake_code, fake_message = smtp.rcpt(fake_recipient)
 
             return real_code, real_message, fake_code, fake_message
-        except (OSError, smtplib.SMTPException) as e:
+        except smtplib.SMTPResponseException as e:
+            raise _smtp_failure(f"SMTP exchange failed with {hostname}", e.smtp_code, e.smtp_error) from e
+        except smtplib.SMTPServerDisconnected as e:
+            raise TemporaryFailure(f"SMTP exchange failed with {hostname}: {e}") from e
+        except smtplib.SMTPException as e:
             raise RuntimeError(f"SMTP exchange failed with {hostname}: {e}") from e
+        except OSError as e:
+            raise TemporaryFailure(f"SMTP exchange failed with {hostname}: {e}") from e
         finally:
-            smtp.close()
+            # Socket cleanup must not replace a reply or the original failure.
+            with suppress(OSError, smtplib.SMTPException):
+                smtp.close()
     else:
-        raise RuntimeError("no reachable mail exchangers")
+        if last_connection_error is not None and not temporary_connection_failure:
+            raise RuntimeError(f"no usable mail exchangers: {last_connection_error}") from last_connection_error
+        raise TemporaryFailure("no reachable mail exchangers")
 
 
 def generate_invalid_address(
@@ -164,8 +217,8 @@ def verify_timeout(
     Ensure the provided timeout limit (in seconds) is valid.
     """
 
-    if timeout < 0:
-        raise ValueError("timeout must be >= 0 seconds")
+    if timeout <= 0:
+        raise ValueError("timeout must be > 0 seconds")
 
     return timeout
 
@@ -195,7 +248,7 @@ def run():
         "--timeout",
         type=int,
         default=5,
-        help="the number of seconds until the SMTP connection times out (default: %(default)s)"
+        help="positive SMTP socket timeout in seconds (default: %(default)s)"
     )
 
     args = parser.parse_args()
@@ -206,59 +259,60 @@ def run():
         recipient = verify_email_syntax(args.recipient)
         timeout = verify_timeout(args.timeout)
     except ValueError as e:
-        print(e)
-        exit(5)
-
+        parser.error(str(e))
 
     # check the recipient directly
     try:
         real_code, real_message, fake_code, fake_message = verify_email(recipient, sender, timeout)
-    except ValueError as e:
-        print(f"invalid input: {e}")
-        exit(5)
+    except UndeliverableDomain as e:
+        print(f"the address {recipient} is undeliverable: {e}")
+        exit(ExitCode.UNDELIVERABLE)
+    except TemporaryFailure as e:
+        print(f"temporary failure checking {recipient}: {e}", file=sys.stderr)
+        exit(ExitCode.TEMPORARY_FAILURE)
     except RuntimeError as e:
-        print(f"unexpected runtime error: {e}")
-        exit(6)
+        print(f"check failed: {e}", file=sys.stderr)
+        exit(ExitCode.RUNTIME_ERROR)
 
     if real_code == 550:
-        print(f"the address {recipient} is likely nonexistent")
+        print(f"the address {recipient} is likely undeliverable (SMTP code 550)")
         if args.verbose:
             print(real_message)
-        exit(1)
+        exit(ExitCode.UNDELIVERABLE)
     elif 400 <= real_code < 500:
-        print(f"temporary failure checking {recipient}")
-        print("perhaps try again later?")
+        print(f"temporary failure checking {recipient}: got SMTP code {real_code}", file=sys.stderr)
+        print("perhaps try again later?", file=sys.stderr)
         if args.verbose:
-            print(real_message)
-        exit(2)
+            print(real_message, file=sys.stderr)
+        exit(ExitCode.TEMPORARY_FAILURE)
     elif real_code == 250:
         if fake_code == 550:
             print(f"the address {recipient} is likely valid")
             if args.verbose:
                 print(real_message)
                 print(fake_message)
-            exit(0)
+            exit(ExitCode.VALID)
         elif fake_code == 250:
             print("this domain might accept all addresses")
             print(f"the address {recipient} passed validation, but so did a likely-nonexistent mailbox address")
             if args.verbose:
                 print(real_message)
                 print(fake_message)
-            exit(4)
-        elif 400 <= fake_code < 500:
-            print(f"temporary failure checking {recipient}")
-            print("perhaps try again later?")
+            exit(ExitCode.CATCH_ALL)
+        elif fake_code is not None and 400 <= fake_code < 500:
+            print(f"temporary failure checking {recipient}: got SMTP code {fake_code} for probe address", file=sys.stderr)
+            print("perhaps try again later?", file=sys.stderr)
             if args.verbose:
-                print(real_message)
-                print(fake_message)
-            exit(2)
+                print(real_message, file=sys.stderr)
+                print(fake_message, file=sys.stderr)
+            exit(ExitCode.TEMPORARY_FAILURE)
         else:
             print(f"got SMTP code {fake_code} for probe address")
             if args.verbose:
                 print(fake_message)
-            exit(3) 
+            exit(ExitCode.INCONCLUSIVE)
     else:
         print(f"address validation failed for {recipient}: got SMTP code {real_code}")
         if args.verbose:
             print(real_message)
-        exit(3)
+        exit(ExitCode.INCONCLUSIVE)

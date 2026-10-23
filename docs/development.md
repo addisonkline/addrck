@@ -28,6 +28,7 @@ tests/
     test_dns.py            MX ordering, null MX, fallback, and resolver errors
     test_smtp.py           Connection attempts, command order, and cleanup
     test_cli.py            Arguments, output, and exit statuses
+    test_exit_statuses.py  CLI statuses through actual DNS/SMTP orchestration
 .github/workflows/tests.yml
 pyproject.toml
 uv.lock
@@ -45,9 +46,9 @@ These describe the internal structure; the supported user interface is the CLI.
 | Function | Responsibility |
 | --- | --- |
 | `verify_email_syntax(address)` | Return the unchanged address or raise `ValueError`. |
-| `verify_timeout(timeout)` | Return a nonnegative timeout or raise `ValueError`; SMTP itself requires a positive value. |
+| `verify_timeout(timeout)` | Return a positive timeout or raise `ValueError`. |
 | `find_mail_exchangers(domain)` | Return an ordered list of MX records, including a synthetic MX for address fallback. |
-| `connect_to_exchanger(hostname, timeout)` | Connect on port 25; return an SMTP object or `None` for caught connection errors. |
+| `connect_to_exchanger(hostname, timeout)` | Connect on port 25; return an SMTP object, `None` for temporary failures, or raise `RuntimeError` for other SMTP failures. |
 | `generate_invalid_address(address)` | Generate a random probe on the supplied address's domain. |
 | `verify_email(recipient, sender, timeout)` | Run the DNS/SMTP check and return `(real_code, real_message, fake_code, fake_message)`. |
 | `run()` | Parse arguments, validate input, classify replies, print output, and exit. |
@@ -56,10 +57,15 @@ These describe the internal structure; the supported user interface is the CLI.
 already passed syntax validation. Note that `verify_email` takes the recipient
 first, while the CLI takes the sender first. SMTP messages in the result tuple
 are bytes.
+The fake code/message are `None` when the real recipient was not accepted and
+the probe was skipped.
 
-Domain/input failures use `ValueError`; caught resolver and exchange failures
-use `RuntimeError`. `run()` maps these to exits `5` and `6`. See the
-[validation flow](validation.md) for details of fallback and retry behavior.
+Exit values are named in `ExitCode`. Invalid CLI input raises `ValueError` and
+is reported through `parser.error()` (exit `2`). `UndeliverableDomain` is distinct
+from caller errors and maps to exit `1`. `TemporaryFailure` maps to exit `5`;
+other caught runtime failures map to exit `6`. See the
+[validation flow](validation.md) for fallback/retry behavior and the
+[usage guide](usage.md#changes-before-v010) for changes to the earlier exit codes.
 
 ## Run tests
 

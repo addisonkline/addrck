@@ -39,16 +39,20 @@ addrck prints a human-readable result and exits with a status code:
 | Code | Meaning |
 | --- | --- |
 | `0` | Recipient accepted and probe rejected with `550`: likely valid. Also used for `--help`. |
-| `1` | Recipient rejected with `550`: likely nonexistent. |
-| `2` | Temporary SMTP failure, or a command-line argument error. |
+| `1` | Recipient rejected with `550`, or domain cannot receive mail: undeliverable. |
+| `2` | Invalid arguments, address syntax, or timeout. |
 | `3` | SMTP recipient/probe response outside the recognized cases. |
 | `4` | Recipient and probe both accepted: possible catch-all domain. |
-| `5` | Invalid input or a domain without usable mail routing. |
-| `6` | DNS resolver, SMTP connection, or SMTP command failure. |
+| `5` | Temporary DNS, connection, or SMTP failure: retry may help. |
+| `6` | Other resolver, protocol, or SMTP command failure. |
 
 The [usage guide](docs/usage.md#exit-statuses) explains the exact response rules
 and how to capture the status in a script. For inconclusive results, start with
 [troubleshooting](docs/troubleshooting.md).
+
+Validation results go to standard output; argument errors and temporary/runtime
+failures go to standard error. Before v0.1.0, these codes were revised to separate
+usage errors from temporary failures; see the [migration notes](docs/usage.md#changes-before-v010).
 
 ## Documentation
 
